@@ -1,0 +1,4 @@
+FROM nvcr.io/nvidia/tritonserver:24.07-py3 as builder
+
+RUN python3 -m pip install --upgrade pip
+RUN pip install transformers torch pillow numpy==1.26 diffusers
