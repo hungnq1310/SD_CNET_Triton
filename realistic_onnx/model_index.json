@@ -1,0 +1,37 @@
+{
+  "_class_name": "OnnxStableDiffusionPipeline",
+  "_diffusers_version": "0.30.2",
+  "feature_extractor": [
+    null,
+    null
+  ],
+  "requires_safety_checker": false,
+  "safety_checker": [
+    null,
+    null
+  ],
+  "scheduler": [
+    "diffusers",
+    "PNDMScheduler"
+  ],
+  "text_encoder": [
+    "diffusers",
+    "OnnxRuntimeModel"
+  ],
+  "tokenizer": [
+    "transformers",
+    "CLIPTokenizer"
+  ],
+  "unet": [
+    "diffusers",
+    "OnnxRuntimeModel"
+  ],
+  "vae_decoder": [
+    "diffusers",
+    "OnnxRuntimeModel"
+  ],
+  "vae_encoder": [
+    "diffusers",
+    "OnnxRuntimeModel"
+  ]
+}

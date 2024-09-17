@@ -6,10 +6,9 @@ import logging
 from pathlib import Path
 import numpy as np
 import torch
-import PIL
+from tqdm import tqdm
 from transformers import CLIPFeatureExtractor, CLIPTokenizer
 
-from diffusers.configuration_utils import FrozenDict
 from diffusers.schedulers import (
     DDIMScheduler,
     DPMSolverMultistepScheduler,
@@ -19,10 +18,9 @@ from diffusers.schedulers import (
     PNDMScheduler,
 )
 from diffusers.utils import deprecate, logging, PIL_INTERPOLATION
-from diffusers.pipelines.onnx_utils import ORT_TO_NP_TYPE, OnnxRuntimeModel
-from diffusers.pipeline_utils import DiffusionPipeline
-from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput
-logger = logging.get_logger(__name__)
+from diffusers.pipelines.onnx_utils import ORT_TO_NP_TYPE
+
+
 try:
     # noinspection PyUnresolvedReferences
     import triton_python_backend_utils as pb_utils
@@ -55,11 +53,11 @@ class TritonPythonModel:
     def initialize(self, args: Dict[str, str]) -> None:
         
         current_name: str = str(Path(args["model_repository"]).parent.absolute())
-        self.device = "cpu" 
-        if args["model_instance_kind"] == "CPU":
-            self.device = "cpu"
-        else: 
+        
+        if args.get("model_instance_kind") == "GPU":
             self.device = "cuda"
+        else: 
+            self.device = "cpu"
         self.tokenizer = CLIPTokenizer.from_pretrained(
             current_name + "/stable_diffusion_cnet_bls/1/tokenizer/"
         )
@@ -77,6 +75,7 @@ class TritonPythonModel:
         self.num_images_per_prompt:int = 1
         self.num_inference_steps: int= 50
         self.controlnet_conditioning_scale: float = 1.0
+        self.logger = pb_utils.Logger
         
 
         
@@ -108,20 +107,35 @@ class TritonPythonModel:
     #     return height, width
         
     def prepare_image(self, image, width, height, batch_size, num_images_per_prompt, dtype):
-        if not isinstance(image, torch.Tensor):
-            if isinstance(image, PIL.Image.Image):
-                image = [image]
+        # print(image)
+        # if not isinstance(image, torch.Tensor):
+        #     if isinstance(image, PIL.Image.Image):
+        #         image = [image]
 
-            if isinstance(image[0], PIL.Image.Image):
-                image = [
-                    torch.tensor(np.array(i.resize((width, height), resample=PIL_INTERPOLATION["lanczos"])))[None, :]
-                    for i in image
-                ]
-                image = torch.cat(image, dim=0)
-                image = image.float() / 255.0
-                image = image.permute(0, 3, 1, 2)  # Transpose for PyTorch (batch, channels, height, width)
-            elif isinstance(image[0], torch.Tensor):
-                image = torch.cat(image, dim=0)
+        #     # if isinstance(image[0], PIL.Image.Image):
+        #         image = [
+        #             torch.tensor(np.array(i.resize((width, height), resample=PIL_INTERPOLATION["lanczos"])))[None, :]
+        #             for i in image
+        #         ]
+        #         image = torch.cat(image, dim=0)
+        #         image = image.float() / 255.0
+        #         image = image.permute(0, 3, 1, 2)  # Transpose for PyTorch (batch, channels, height, width)
+        #     elif isinstance(image, List[torch.Tensor]):
+        #         image = torch.cat(image, dim=0)
+                
+        #     elif isinstance(image, np.array):
+        #         image = torch.tensor(image)
+        #         image = image.float() / 255.0
+        #         image = image.permute(0, 3, 1, 2)  
+
+        
+        #* image pass through triton server is np.array
+        image = torch.tensor(image)
+        # image = image.resize((width, height))
+        # image = torch.cat(image, dim=0)
+        image = image.unsqueeze(0)
+        image = image.float() / 255.0
+        image = image.permute(0, 3, 1, 2)
 
         image_batch_size = image.shape[0]
 
@@ -190,43 +204,50 @@ class TritonPythonModel:
         """
         batch_size = len(prompt) if isinstance(prompt, list) else 1
 
-        # get prompt text embeddings
-        text_inputs = self.tokenizer(
+        # get prompt text embeddings with truncation
+        text_input_ids = self.tokenizer(
             prompt,
             padding="max_length",
             max_length=self.tokenizer.model_max_length,
             truncation=True,
-            return_tensors="pt",
-        )
-        text_input_ids = text_inputs.input_ids
-        untruncated_ids = self.tokenizer(prompt, padding="max_length", return_tensors="np").input_ids
+            return_tensors="np",
+        ).input_ids.astype(np.int32)
+        # raw prompt without truncation
+        untruncated_ids = self.tokenizer(
+            prompt, 
+            padding="max_length", 
+            return_tensors="np"
+        ).input_ids.astype(np.int32)
 
-        if not torch.equal(text_input_ids, untruncated_ids):
-            removed_text = self.tokenizer.batch_decode(untruncated_ids[:, self.tokenizer.model_max_length - 1 : -1])
-            logger.warning(
+        # only for logging
+        if not np.array_equal(text_input_ids, untruncated_ids):
+            removed_text = self.tokenizer.batch_decode(
+                untruncated_ids[:, self.tokenizer.model_max_length - 1 : -1]
+            )
+            self.logger.warning(
                 "The following part of your input was truncated because CLIP can only handle sequences up to"
                 f" {self.tokenizer.model_max_length} tokens: {removed_text}"
             )
             
-        input_ids = text_input_ids.type(dtype=torch.int32)
-        text_input_encoder = [
-            pb_utils.Tensor.from_dlpack("input_ids", torch.to_dlpack(input_ids))
-        ]
+        # call `text encoder` for prompt embeddings (have truncation) 
+        # input_ids = text_input_ids.type(dtype=torch.int32)
+        text_input_encoder = pb_utils.Tensor("input_ids", text_input_ids)
+        
         inference_request = pb_utils.InferenceRequest(
             model_name="text_encoder",
             requested_output_names=["last_hidden_state"],
-            inputs=text_input_encoder,
+            inputs=[text_input_encoder],
         )
         inference_response = inference_request.exec()
         if inference_response.has_error():
             raise pb_utils.TritonModelException(
                 inference_response.error().message()
             )
-        else:
-            output = pb_utils.get_output_tensor_by_name(
-                inference_response, "last_hidden_state"
-            )
-            text_embeddings: torch.Tensor = torch.from_dlpack(output.to_dlpack())
+        
+        output = pb_utils.get_output_tensor_by_name(
+            inference_response, "last_hidden_state"
+        )
+        text_embeddings: torch.Tensor = torch.from_dlpack(output.to_dlpack())
         bs_embed, seq_len, _ = text_embeddings.shape
         text_embeddings = text_embeddings.repeat(1, num_images_per_prompt, 1)
         text_embeddings = text_embeddings.view(
@@ -257,26 +278,23 @@ class TritonPythonModel:
                 uncond_tokens = negative_prompt
 
             max_length = text_input_ids.shape[-1]
-            uncond_input = self.tokenizer(
+            uncond_input_ids = self.tokenizer(
                 uncond_tokens,
                 padding="max_length",
                 max_length=max_length,
                 truncation=True,
-                return_tensors="pt",
-            )
+                return_tensors="np",
+            ).input_ids.astype(np.int32)
 
             # For classifier free guidance, we need to do two forward passes.
             # Here we concatenate the unconditional and text embeddings into a single batch
             # to avoid doing two forward passes
-            input_ids = uncond_input.input_ids.type(dtype=torch.int32)
-            inputs = [
-                pb_utils.Tensor.from_dlpack("input_ids", torch.to_dlpack(input_ids))
-            ]
+            uncond_input = pb_utils.Tensor("input_ids", uncond_input_ids)
 
             inference_request = pb_utils.InferenceRequest(
                 model_name="text_encoder",
                 requested_output_names=["last_hidden_state"],
-                inputs=inputs,
+                inputs=[uncond_input],
             )
             inference_response = inference_request.exec()
             if inference_response.has_error():
@@ -335,7 +353,7 @@ class TritonPythonModel:
                 for t in pb_utils.get_input_tensor_by_name(request, "POSE_IMAGE")
                 .as_numpy()
                 .tolist()
-            ][0]
+            ]
             
             scheduler = [
                 t.decode("UTF-8")
@@ -376,12 +394,12 @@ class TritonPythonModel:
             else:
                 raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
             
-            if generator:
-                torch_seed = generator.randint(seed)
-                torch_gen = torch.Generator().manual_seed(torch_seed)
-            else:
-                generator = torch.randn
-                torch_gen = None
+            # if generator:
+            #     torch_seed = generator.randint(seed)
+            #     torch_gen = torch.Generator().manual_seed(torch_seed)
+            # else:
+            generator = torch.Generator().manual_seed(seed)
+            torch_gen = None
                 
             # height = 512
             # width = 512        
@@ -401,22 +419,21 @@ class TritonPythonModel:
             
         do_classifier_free_guidance = self.guidance_scale > 1.0
 
-        prompt_embeds = self._encode_prompt(
+        # encode prompt
+        prompt_embeds: torch.Tensor = self._encode_prompt(
             prompt, self.num_images_per_prompt, do_classifier_free_guidance, negative_prompt
         )
         
         # 4. Prepare image
         image = self.prepare_image(
-            pose_image,
-            self.width,
-            self.height ,
-            batch_size * self.num_images_per_prompt,
-            self.num_images_per_prompt,
-            torch.float32,
+            image=pose_image,
+            width=self.width,
+            height=self.height ,
+            batch_size=batch_size * self.num_images_per_prompt,
+            num_images_per_prompt=self.num_images_per_prompt,
+            dtype=torch.float32,
         )
         
-        if do_classifier_free_guidance:
-            image = torch.cat([image] * 2, dim=0)
 
         # get the initial random noise unless the user supplied it
         latents_dtype = prompt_embeds.dtype
@@ -424,17 +441,20 @@ class TritonPythonModel:
         
         num_channels_latents = 4
         latents = self.prepare_latents(
-            batch_size * self.num_images_per_prompt,
-            num_channels_latents,
-            self.height ,
-            self.width,
-            latents_dtype,
-            generator,
-            latents,
+            batch_size=(batch_size * self.num_images_per_prompt),
+            num_channels_latents= num_channels_latents,
+            height=self.height ,
+            width=self.width,
+            dtype=latents_dtype,
+            generator=generator,
         )
+
+        if do_classifier_free_guidance:
+            image = torch.cat([image] * 2, dim=0)
+            latents = torch.cat([latents] * 2)
         
         # set timesteps
-        self.scheduler.set_timesteps(self.num_inference_steps, device=self.device)
+        self.scheduler.set_timesteps(self.num_inference_steps) #? why device put here
         timesteps = self.scheduler.timesteps
 
 
@@ -443,31 +463,51 @@ class TritonPythonModel:
         # eta corresponds to η in DDIM paper: https://arxiv.org/abs/2010.02502
         # and should be between [0, 1]
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, self.eta, torch_gen)
-        timestep_dtype = ORT_TO_NP_TYPE["tensor(float)"]
+
+        # prepare the output
+        # timestep_dtype = ORT_TO_NP_TYPE["tensor(float)"]
         num_warmup_steps = len(timesteps) - self.num_inference_steps * self.scheduler.order
         
-        
-        
-        with self.progress_bar(total=self.num_inference_steps) as progress_bar:
+        with tqdm(total=self.num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
-                latent_model_input = (torch.cat([latents] * 2) if do_classifier_free_guidance else latents)
+                latent_model_input = latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
                 
-                timestep = t[None].type(dtype=torch.float16)
-                encoder_hidden_states = prompt_embeds.type(dtype=torch.float16)
-                
+                timestep = t[None].type(dtype=torch.float32)
+                encoder_hidden_states = prompt_embeds.type(dtype=torch.float32)
+            
+                # inputs_cnet = [
+                #     pb_utils.Tensor.from_dlpack("sample", torch.to_dlpack(latent_model_input.type(dtype=torch.float16))),
+                #     pb_utils.Tensor.from_dlpack("timestep", torch.to_dlpack(timestep)),
+                #     pb_utils.Tensor.from_dlpack("encoder_hidden_states", torch.to_dlpack(encoder_hidden_states)),
+                #     pb_utils.Tensor.from_dlpack("controlnet_cond", torch.to_dlpack(image.type(dtype=torch.float16))),
+                #     pb_utils.Tensor.from_dlpack("conditioning_scale", torch.to_dlpack(torch.tensor([self.controlnet_conditioning_scale], dtype=torch.float16))),
+                # ]
+
                 inputs_cnet = [
-                    pb_utils.Tensor.from_dlpack("sample", torch.to_dlpack(latent_model_input)),
-                    pb_utils.Tensor.from_dlpack("timestep", torch.to_dlpack(timestep)),
-                    pb_utils.Tensor.from_dlpack("encoder_hidden_states", torch.to_dlpack(encoder_hidden_states)),
-                    pb_utils.Tensor.from_dlpack("controlnet_cond", torch.to_dlpack(image)),
+                    pb_utils.Tensor("sample", latent_model_input.cpu().numpy()),
+                    pb_utils.Tensor("timestep", timestep.cpu().numpy()),
+                    pb_utils.Tensor("encoder_hidden_states", encoder_hidden_states.cpu().numpy()), 
+                    pb_utils.Tensor("controlnet_cond", image.numpy()),
+                    pb_utils.Tensor("conditioning_scale", 
+                                               np.array([self.controlnet_conditioning_scale])
+                                               ),
                 ]
+                
+                # Truong model
+                # outputs_cnet = [
+                #     "output", "2587", "2588", "2589", "2590", 
+                #     "2591", "2592", "2593", "2594", "2595", 
+                #     "2596", "2597", "2598"
+                # ]        
+                       
+                # new model
                 outputs_cnet = [
-                    "output", "2587", "2588", "2589", "2590", 
-                    "2591", "2592", "2593", "2594", "2595", 
-                    "2596", "2597", "2598"
-                ]               
+                    "down_block_res_samples", "mid_block_res_sample", #! missing concept name
+                    "2773", "2775", "2777", "2779", "2781", "2783", 
+                    "2785", "2787", "2789", "2791", "2793"
+                ]
                 
                 inference_request = pb_utils.InferenceRequest(
                     model_name="cnet",  # Assuming the model is named "controlnet"
@@ -481,45 +521,75 @@ class TritonPythonModel:
                         inference_response.error().message())
                 else:
                     # Extract the output tensors from the inference response.
-                    mid_block_res_sample = pb_utils.get_output_tensor_by_name(inference_response, '2598')
-                    down_block_res_samples = (
-                        pb_utils.get_output_tensor_by_name(inference_response, 'output'),
-                        pb_utils.get_output_tensor_by_name(inference_response, '2587'),
-                        pb_utils.get_output_tensor_by_name(inference_response, '2588'),
-                        pb_utils.get_output_tensor_by_name(inference_response, '2589'),
-                        pb_utils.get_output_tensor_by_name(inference_response, '2590'),
-                        pb_utils.get_output_tensor_by_name(inference_response, '2591'),
-                        pb_utils.get_output_tensor_by_name(inference_response, '2592'),
-                        pb_utils.get_output_tensor_by_name(inference_response, '2593'),
-                        pb_utils.get_output_tensor_by_name(inference_response, '2594'),
-                        pb_utils.get_output_tensor_by_name(inference_response, '2595'),
-                        pb_utils.get_output_tensor_by_name(inference_response, '2596'),
-                        pb_utils.get_output_tensor_by_name(inference_response, '2597')
+                    # mid_block_res_sample = pb_utils.get_output_tensor_by_name(inference_response, '2598')
+                    # down_block_res_samples = (
+                    #     pb_utils.get_output_tensor_by_name(inference_response, 'output'),
+                    #     pb_utils.get_output_tensor_by_name(inference_response, '2587'),
+                    #     pb_utils.get_output_tensor_by_name(inference_response, '2588'),
+                    #     pb_utils.get_output_tensor_by_name(inference_response, '2589'),
+                    #     pb_utils.get_output_tensor_by_name(inference_response, '2590'),
+                    #     pb_utils.get_output_tensor_by_name(inference_response, '2591'),
+                    #     pb_utils.get_output_tensor_by_name(inference_response, '2592'),
+                    #     pb_utils.get_output_tensor_by_name(inference_response, '2593'),
+                    #     pb_utils.get_output_tensor_by_name(inference_response, '2594'),
+                    #     pb_utils.get_output_tensor_by_name(inference_response, '2595'),
+                    #     pb_utils.get_output_tensor_by_name(inference_response, '2596'),
+                    #     pb_utils.get_output_tensor_by_name(inference_response, '2597')
+                    # )
+                    # mid_block_res_sample = pb_utils.get_output_tensor_by_name(inference_response, '2793')
+                    mid_block_res_sample = torch.from_dlpack(
+                        pb_utils.get_output_tensor_by_name(inference_response, '2793')
                     )
+                    down_block_res_samples = [
+                        torch.from_dlpack(
+                            pb_utils.get_output_tensor_by_name(inference_response, name).to_dlpack()
+                        # pb_utils.get_output_tensor_by_name(inference_response, name).as_numpy()
+                        ) 
+                        for name in outputs_cnet[:-1]
+                    ]
                 down_block_res_samples = [
-                    down_block_res_sample * self.controlnet_conditioning_scale
+                    down_block_res_sample.to(device="cpu") * torch.tensor([self.controlnet_conditioning_scale])
                     for down_block_res_sample in down_block_res_samples
                 ]
-                mid_block_res_sample *= self.controlnet_conditioning_scale
+                mid_block_res_sample = mid_block_res_sample.to(device="cpu") * torch.tensor([self.controlnet_conditioning_scale])
+                # mid_block_res_sample = mid_block_res_sample.as_numpy() * np.array([self.controlnet_conditioning_scale])
                             
                 
+                # inputs_unet = [
+                #     pb_utils.Tensor.from_dlpack("sample", torch.to_dlpack(latent_model_input.type(dtype=torch.float32))),
+                #     pb_utils.Tensor.from_dlpack("timestep", torch.to_dlpack(timestep.type(dtype=torch.float32))),
+                #     pb_utils.Tensor.from_dlpack("encoder_hidden_states", torch.to_dlpack(prompt_embeds.type(dtype=torch.float32))),
+                #     pb_utils.Tensor.from_dlpack("down_block_0", torch.to_dlpack(down_block_res_samples[0])),
+                #     pb_utils.Tensor.from_dlpack("down_block_1", torch.to_dlpack(down_block_res_samples[1])),
+                #     pb_utils.Tensor.from_dlpack("down_block_2", torch.to_dlpack(down_block_res_samples[2])),
+                #     pb_utils.Tensor.from_dlpack("down_block_3", torch.to_dlpack(down_block_res_samples[3])),
+                #     pb_utils.Tensor.from_dlpack("down_block_4", torch.to_dlpack(down_block_res_samples[4])),
+                #     pb_utils.Tensor.from_dlpack("down_block_5", torch.to_dlpack(down_block_res_samples[5])),
+                #     pb_utils.Tensor.from_dlpack("down_block_6", torch.to_dlpack(down_block_res_samples[6])),
+                #     pb_utils.Tensor.from_dlpack("down_block_7", torch.to_dlpack(down_block_res_samples[7])),
+                #     pb_utils.Tensor.from_dlpack("down_block_8", torch.to_dlpack(down_block_res_samples[8])),
+                #     pb_utils.Tensor.from_dlpack("down_block_9", torch.to_dlpack(down_block_res_samples[9])),
+                #     pb_utils.Tensor.from_dlpack("down_block_10", torch.to_dlpack(down_block_res_samples[10])),
+                #     pb_utils.Tensor.from_dlpack("down_block_11", torch.to_dlpack(down_block_res_samples[11])),
+                #     pb_utils.Tensor.from_dlpack("mid_block_additional_residual", torch.to_dlpack(mid_block_res_sample)),
+                # ]
                 inputs_unet = [
-                    pb_utils.Tensor.from_dlpack("sample", torch.to_dlpack(latent_model_input)),
-                    pb_utils.Tensor.from_dlpack("timestep", torch.to_dlpack(timestep)),
-                    pb_utils.Tensor.from_dlpack("encoder_hidden_states", torch.to_dlpack(prompt_embeds)),
-                    pb_utils.Tensor.from_dlpack("down_block_0", torch.to_dlpack(down_block_res_samples[0])),
-                    pb_utils.Tensor.from_dlpack("down_block_1", torch.to_dlpack(down_block_res_samples[1])),
-                    pb_utils.Tensor.from_dlpack("down_block_2", torch.to_dlpack(down_block_res_samples[2])),
-                    pb_utils.Tensor.from_dlpack("down_block_3", torch.to_dlpack(down_block_res_samples[3])),
-                    pb_utils.Tensor.from_dlpack("down_block_4", torch.to_dlpack(down_block_res_samples[4])),
-                    pb_utils.Tensor.from_dlpack("down_block_5", torch.to_dlpack(down_block_res_samples[5])),
-                    pb_utils.Tensor.from_dlpack("down_block_6", torch.to_dlpack(down_block_res_samples[6])),
-                    pb_utils.Tensor.from_dlpack("down_block_7", torch.to_dlpack(down_block_res_samples[7])),
-                    pb_utils.Tensor.from_dlpack("down_block_8", torch.to_dlpack(down_block_res_samples[8])),
-                    pb_utils.Tensor.from_dlpack("down_block_9", torch.to_dlpack(down_block_res_samples[9])),
-                    pb_utils.Tensor.from_dlpack("down_block_10", torch.to_dlpack(down_block_res_samples[10])),
-                    pb_utils.Tensor.from_dlpack("down_block_11", torch.to_dlpack(down_block_res_samples[11])),
-                    pb_utils.Tensor.from_dlpack("mid_block_additional_residual", torch.to_dlpack(mid_block_res_sample)),
+                    pb_utils.Tensor("sample", latent_model_input.cpu().numpy()),
+                    pb_utils.Tensor("timestep", timestep.cpu().numpy()),
+                    pb_utils.Tensor("encoder_hidden_states", prompt_embeds.cpu().numpy()),
+                    pb_utils.Tensor("down_block_0", down_block_res_samples[0].numpy()),
+                    pb_utils.Tensor("down_block_1", down_block_res_samples[1].numpy()),
+                    pb_utils.Tensor("down_block_2", down_block_res_samples[2].numpy()),
+                    pb_utils.Tensor("down_block_3", down_block_res_samples[3].numpy()),
+                    pb_utils.Tensor("down_block_4", down_block_res_samples[4].numpy()),
+                    pb_utils.Tensor("down_block_5", down_block_res_samples[5].numpy()),
+                    pb_utils.Tensor("down_block_6", down_block_res_samples[6].numpy()),
+                    pb_utils.Tensor("down_block_7", down_block_res_samples[7].numpy()),
+                    pb_utils.Tensor("down_block_8", down_block_res_samples[8].numpy()),
+                    pb_utils.Tensor("down_block_9", down_block_res_samples[9].numpy()),
+                    pb_utils.Tensor("down_block_10", down_block_res_samples[10].numpy()),
+                    pb_utils.Tensor("down_block_11", down_block_res_samples[11].numpy()),
+                    pb_utils.Tensor("mid_block_additional_residual", mid_block_res_sample.numpy()),
                 ]
 
                 # Create the inference request for the `unet` model
@@ -532,13 +602,13 @@ class TritonPythonModel:
                 # Execute the inference request
                 inference_response_unet = inference_request_unet.exec()
 
-                if inference_response.has_error():
+                if inference_response_unet.has_error():
                     raise pb_utils.TritonModelException(
-                        inference_response.error().message()
+                        inference_response_unet.error().message()
                     )
                 else:
                     output = pb_utils.get_output_tensor_by_name(
-                        inference_response, "out_sample"
+                        inference_response_unet, "out_sample"
                     )
                     noise_pred: torch.Tensor = torch.from_dlpack(output.to_dlpack())
                 
@@ -550,7 +620,7 @@ class TritonPythonModel:
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(
-                    noise_pred, t, latents, **extra_step_kwargs
+                    noise_pred.to(device=self.device), t, latents.to(device=self.device), **extra_step_kwargs
                 ).prev_sample
 
                 # call the callback, if provided
