@@ -1,11 +1,30 @@
 services:
+  sdcnet:
+    image: heronq02/stable-diffusion:cnetpose-r0.0.1
+    environment:
+      - MODEL_NAME="stable_diffusion_cnet_bls"
+      - MODEL_VERSION=1
+      - BATCH_SIZE=1
+      - TRITON_URL="localhost:7000"
+      - PROTOCOL="http"
+      - ASYNC_SET=true
+
+    ports:
+      - "7999:7999"
+    depends_on:
+      triton:
+        condition: service_healthy
+    links:
+      - triton:triton
+    command: fastapi run src/api.py --port 6999 --root-path /sdcnet
+
   triton:
     build:
       context: .
       dockerfile: Dockerfile.triton
-    shm_size: '4gb'
+    shm_size: '12gb'
     volumes:
-      - ${PWD}/realistic_onnx:/models
+      - ${PWD}/dumps_folder/sd-cvae-slicing-xformers-withslice:/models
     ports:
       - "7000:7000"
       - "7001:7001"
