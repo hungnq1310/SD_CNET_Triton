@@ -88,6 +88,7 @@ class InferRequest(BaseModel):
     scheduler: str
     steps: int
     guidance_scale: float
+    cnet_conditional_scale: float
     seed: int
 
 ############
@@ -110,6 +111,7 @@ async def inference(
     scheduler: Optional[str] = None,
     steps: Optional[int] = None,
     guidance_scale: Optional[float] = None,
+    cnet_conditional_scale: Optional[float] = None,
     seed: Optional[int] = None,
 ):
     
@@ -142,6 +144,7 @@ async def inference(
     scheduler = "PNDMScheduler" if scheduler is None else scheduler
     steps = 20 if steps is None else steps
     guidance_scale = 1.0 if guidance_scale is None else guidance_scale
+    cnet_conditional_scale = 1.0 if cnet_conditional_scale is None else cnet_conditional_scale
     seed = -1 if seed is None else seed
 
     # create inferReqeust
@@ -152,6 +155,7 @@ async def inference(
         scheduler=scheduler,
         steps=steps,
         guidance_scale=guidance_scale,
+        cnet_conditional_scale=cnet_conditional_scale,
         seed=seed,
     )
     # return the image paths
@@ -172,6 +176,7 @@ async def diffusers(inferRequest: InferRequest) -> JSONResponse:
         np.array([inferRequest.scheduler], dtype=np.object_),
         np.array([inferRequest.steps], dtype=np.int32),
         np.array([inferRequest.guidance_scale], dtype=np.float32),
+        np.array([inferRequest.cnet_conditional_scale], dtype=np.float32),
         np.array([inferRequest.seed], dtype=np.int64),
     ]
 

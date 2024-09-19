@@ -29,17 +29,17 @@ def parse_model(model_metadata, model_config):
     requirements for an image classification network (as expected by
     this client)
     """
-    if len(model_metadata.inputs) != 7:
-        raise Exception("expecting 7 input, got {}".format(len(model_metadata.inputs)))
+    if len(model_metadata.inputs) != 8:
+        raise Exception("expecting 8 input, got {}".format(len(model_metadata.inputs)))
     if len(model_metadata.outputs) != 1:
         print(model_metadata.outputs)
         raise Exception(
             "expecting 1 output, got {}".format(len(model_metadata.outputs))
         )
 
-    if len(model_config.input) != 7:
+    if len(model_config.input) != 8:
         raise Exception(
-            "expecting 7 input in model configuration, got {}".format(
+            "expecting 8 input in model configuration, got {}".format(
                 len(model_config.input)
             )
         )
